@@ -1,0 +1,83 @@
+name: Pipeline Async Lint
+description: "Lint OWUI pipeline files for async-correctness — flag sync requests.X / psycopg2.X calls inside async def bodies that aren't wrapped in asyncio.to_thread or loop.run_in_executor."
+author: dvystrcil
+
+inputs:
+  paths:
+    description: "Space-separated list of file paths OR glob patterns to lint. Example: 'pipelines/**/*.py' or 'helpers/git_sync_filter.py prompts/owui/tools/*.py'. Globs are expanded by the shell."
+    required: true
+  exclude:
+    description: "Newline-separated `find` -path patterns to prune from discovery. Default excludes virtualenvs, caches, tests, and eval/ directories."
+    required: false
+    default: |
+      */.venv
+      *__pycache__*
+      */eval/*
+      */tests/*
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Discover + lint pipeline files
+      shell: bash
+      env:
+        INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+      run: |
+        set -euo pipefail
+
+        # Build the find -prune expression from the exclude input. Each
+        # non-empty line becomes `-path '<pattern>'` joined by -o, all
+        # wrapped in parentheses + followed by -prune. If exclude is empty
+        # we skip the prune branch entirely.
+        prune_args=()
+        while IFS= read -r pat; do
+          [ -z "$pat" ] && continue
+          if [ ${#prune_args[@]} -gt 0 ]; then
+            prune_args+=("-o")
+          fi
+          prune_args+=("-path" "$pat")
+        done <<< "$INPUT_EXCLUDE"
+
+        # Expand the paths input. Each token may be a literal file, a
+        # directory, or a glob pattern. We let the shell glob, then collect
+        # every .py file under any directory roots.
+        files=()
+        # shellcheck disable=SC2206  # we want word-splitting + globbing
+        tokens=($INPUT_PATHS)
+        for tok in "${tokens[@]}"; do
+          if [ -f "$tok" ]; then
+            files+=("$tok")
+          elif [ -d "$tok" ]; then
+            if [ ${#prune_args[@]} -gt 0 ]; then
+              mapfile -t found < <(find "$tok" \( "${prune_args[@]}" \) -prune -o -name '*.py' -not -name 'test_*.py' -not -name 'conftest.py' -print | sort)
+            else
+              mapfile -t found < <(find "$tok" -name '*.py' -not -name 'test_*.py' -not -name 'conftest.py' -print | sort)
+            fi
+            files+=("${found[@]}")
+          else
+            # Bare glob — let the shell expand it (already happened in the
+            # token-split above). If $tok still contains a *, that means no
+            # files matched; skip silently.
+            case "$tok" in
+              *\**) echo "  (no match for glob: $tok)" ;;
+              *) echo "warning: $tok not a file/dir/glob, skipping" >&2 ;;
+            esac
+          fi
+        done
+
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "no pipeline files to lint"
+          exit 0
+        fi
+
+        echo "Linting ${#files[@]} pipeline file(s):"
+        printf '  %s\n' "${files[@]}"
+        echo
+
+        python3 "${GITHUB_ACTION_PATH}/lint_pipeline_async.py" "${files[@]}"
