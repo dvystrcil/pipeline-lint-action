@@ -1,0 +1,38 @@
+name: self-test
+
+# Thin on purpose. This repo has no test suite -- unlike its sibling
+# pipeline-contract-action, which has one that simply never ran -- so
+# there is nothing here to execute yet. A byte-compile plus an argparse
+# smoke is the honest ceiling until real tests exist; it catches syntax
+# errors and import-time breakage, and nothing more. Do not read a green
+# check here as "the linter works".
+on:
+  pull_request:
+    paths:
+      - 'action.yaml'
+      - 'lint_pipeline_async.py'
+      - '.github/workflows/self-test.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Byte-compile
+        run: python3 -m py_compile lint_pipeline_async.py
+      - name: Action metadata parses
+        run: |
+          set -euo pipefail
+          pip install --quiet pyyaml
+          python3 -c "
+          import yaml, sys
+          d = yaml.safe_load(open('action.yaml'))
+          assert d.get('runs'), 'action.yaml has no runs: block'
+          print('SYNTAX-CHECK-COMPLETE — action.yaml valid, script compiles')
+          "
