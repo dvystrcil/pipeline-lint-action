@@ -1,6 +1,6 @@
 # pipeline-lint-action
 
-Composite GitHub Action that lints OWUI pipeline / filter / tool files for **async-correctness** — flags sync `requests.X()` or `psycopg2.X()` calls inside `async def` bodies when they aren't wrapped in `asyncio.to_thread()` or `loop.run_in_executor()`.
+Composite GitHub Action that lints OWUI pipeline / filter / tool files for **async-correctness** — flags blocking calls (`requests.X()`, `psycopg2.X()`, `time.sleep()`, `urllib.request.urlopen()`) inside `async def` bodies when they aren't wrapped in `asyncio.to_thread()` or `loop.run_in_executor()` — including when the blocking call is hidden behind a plain `def` helper in the same file.
 
 Catches the wedge pattern from [open-webui#41](https://github.com/dvystrcil/open-webui/issues/41) (uvicorn event-loop freeze) at PR-review time, before the bug reaches the cluster.
 
@@ -61,12 +61,25 @@ async def inlet(self, body):
 async def inlet(self, body):
     return await asyncio.to_thread(self._sync_helper)
 
-# CLEAN — sync calls in a *sync* def are not the lint's concern
+# CLEAN — a sync def on its own is not the lint's concern
 def _sync_helper(self):
     return requests.get(url).json()
+
+# FLAGGED — ...but calling it directly from async def is (open-webui#67)
+async def inlet(self, body):
+    data = self._sync_helper()       # reaches requests.get via the helper
+
+# CLEAN — the helper runs on a worker thread
+async def inlet(self, body):
+    data = await asyncio.to_thread(self._sync_helper)
+    data = await loop.run_in_executor(None, lambda: self._sync_helper())
 ```
 
 The check is AST-based: walks each `async def` body and inspects every `Call` node. A call is OK if its enclosing call chain includes `asyncio.to_thread`, `loop.run_in_executor`, or `*.run_in_executor`. Otherwise it's flagged with file:line:col + a GitHub-Actions annotation.
+
+Banned: anything under `requests.` or `psycopg2.`, plus `time.sleep` and `urllib.request.urlopen`. Import aliases (`import requests as rq`, `from time import sleep`) are resolved.
+
+**Sync helpers.** A call from an `async def` to a plain `def` that reaches a banned call — directly or through further helpers — is flagged at the call site, with the chain in the message. Resolution is same-file only: `name()` → module-level `def name`, `self.name()` / `cls.name()` → `def name` in the enclosing class, `Klass.name()` → a module-level class's method. Calls into other modules, instance attributes (`self.client.get()`), and dynamic dispatch are not followed. Tests: `python3 -m unittest discover -s tests -v`.
 
 ## Exit code
 

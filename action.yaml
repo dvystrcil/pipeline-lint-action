@@ -1,5 +1,5 @@
 name: Pipeline Async Lint
-description: "Lint OWUI pipeline files for async-correctness — flag sync requests.X / psycopg2.X calls inside async def bodies that aren't wrapped in asyncio.to_thread or loop.run_in_executor."
+description: "Lint OWUI pipeline files for async-correctness — flag blocking calls (requests, psycopg2, time.sleep, urlopen) inside async def bodies, directly or via same-file sync helpers, that aren't wrapped in asyncio.to_thread or loop.run_in_executor."
 author: dvystrcil
 
 inputs:
