@@ -11,17 +11,20 @@ This lint walks each *.py file (typically the OWUI pipelines tree),
 finds every `async def` and recursively checks every `Call` node inside
 it. A call is FLAGGED if:
 
-  1. The call's function looks like a banned sync client:
+  1. The call's function looks like a banned blocking call:
        - `requests.<anything>(...)`
        - `psycopg2.<anything>(...)` (most notably `psycopg2.connect`)
+       - `time.sleep(...)`, `urllib.request.urlopen(...)`
+     (import aliases are resolved), OR it is a same-file sync helper
+     (`def`) that reaches one of those, directly or via other helpers.
   2. The call's nearest *async-dispatch* ancestor is NOT one of:
        - `asyncio.to_thread`
        - `loop.run_in_executor` / `<...>.run_in_executor`
        - `asyncio.create_task` (fire-and-forget wrapping a to_thread)
 
 Calls outside any `async def` are not the concern of this lint —
-sync helper methods are fine; the bug is only when sync I/O blocks
-the event loop directly.
+a blocking sync helper is fine on its own; the bug is when an async def
+calls it on the event loop instead of via `asyncio.to_thread(helper)`.
 
 Usage:
   python3 scripts/lint_pipeline_async.py pipelines/**/*.py
@@ -44,6 +47,9 @@ from pathlib import Path
 # Module roots whose direct method/function calls are banned in async bodies
 # unless wrapped in a threadpool dispatch.
 BANNED_ROOTS = frozenset({"requests", "psycopg2"})
+
+# Individual blocking calls from otherwise-fine modules.
+BANNED_CALLS = frozenset({"time.sleep", "urllib.request.urlopen"})
 
 # Function names that, when used as the OUTER call, indicate the inner call is
 # correctly dispatched off the event loop. e.g. `asyncio.to_thread(requests.post, ...)`
@@ -75,12 +81,39 @@ def _call_func_label(node: ast.Call) -> str | None:
     return None
 
 
-def _is_banned_call(node: ast.Call) -> bool:
+def _import_aliases(tree: ast.Module) -> dict[str, str]:
+    """Map local names to the qualified names they import, so
+    `import requests as rq` / `from time import sleep` are still caught."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    aliases[a.asname] = a.name
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for a in node.names:
+                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+    return aliases
+
+
+def _qualified_label(node: ast.Call, aliases: dict[str, str]) -> str | None:
     label = _call_func_label(node)
     if not label:
-        return False
-    root = label.split(".", 1)[0]
-    return root in BANNED_ROOTS
+        return None
+    head, _, rest = label.partition(".")
+    if head in aliases:
+        label = aliases[head] + ("." + rest if rest else "")
+    return label
+
+
+def _blocking_label(node: ast.Call, aliases: dict[str, str]) -> str | None:
+    """The qualified name of a banned blocking call, or None."""
+    label = _qualified_label(node, aliases)
+    if not label:
+        return None
+    if label.split(".", 1)[0] in BANNED_ROOTS or label in BANNED_CALLS:
+        return label
+    return None
 
 
 def _is_dispatch_call(node: ast.Call) -> bool:
@@ -93,16 +126,15 @@ def _is_dispatch_call(node: ast.Call) -> bool:
     return last in DISPATCH_NAMES
 
 
-class _AsyncBodyVisitor(ast.NodeVisitor):
-    """Walk one `async def` body, recording banned-call violations."""
+class _BodyCallVisitor(ast.NodeVisitor):
+    """Walk one function body, collecting every Call that runs on the
+    calling thread — i.e. is not inside the args of a to_thread /
+    run_in_executor dispatch."""
 
-    def __init__(self, fname: str) -> None:
-        self.fname = fname
-        self.violations: list[tuple[int, int, str]] = []
+    def __init__(self) -> None:
+        self.calls: list[ast.Call] = []
         # call-stack tracking — when we enter a `Call` that's a dispatch,
-        # we mark child calls in its args as "covered" by that dispatch.
-        # The simplest way to do this is: at each Call, look at the parent
-        # call (passed via a stack we maintain ourselves).
+        # child calls in its args are "covered" by that dispatch.
         self._covering_stack: list[ast.Call] = []
 
     def generic_visit(self, node: ast.AST) -> None:
@@ -113,41 +145,94 @@ class _AsyncBodyVisitor(ast.NodeVisitor):
         super().generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # If this call is a dispatch, anything in its args is "covered"
-        # — we don't need to flag a banned call passed as the FUNC
-        # argument to to_thread (`asyncio.to_thread(requests.post, url, ...)`)
-        # because `requests.post` is just a function reference; the actual
-        # call happens inside to_thread on a worker thread.
-        is_dispatch = _is_dispatch_call(node)
-
-        # Check this call itself.
-        if _is_banned_call(node):
-            covered = any(_is_dispatch_call(c) for c in self._covering_stack)
-            if not covered:
-                label = _call_func_label(node) or "<dynamic>"
-                self.violations.append((
-                    node.lineno,
-                    node.col_offset,
-                    f"sync `{label}(...)` called inside async def — "
-                    f"wrap in `asyncio.to_thread(...)` "
-                    f"(open-webui#67)",
-                ))
-
-        # Recurse, marking this Call as covering for its children if it's a dispatch.
+        # A banned call passed as the FUNC argument to to_thread
+        # (`asyncio.to_thread(requests.post, url, ...)`) is just a function
+        # reference; a call inside a lambda/partial passed to it runs on a
+        # worker thread. Either way it is covered.
+        if not any(_is_dispatch_call(c) for c in self._covering_stack):
+            self.calls.append(node)
         self._covering_stack.append(node)
         try:
-            # Visit children manually because generic_visit would skip the func node only for AsyncFunctionDef.
-            # For a Call, we want to visit args + keywords + func.
-            if isinstance(node.func, ast.AST):
-                self.visit(node.func)
+            self.visit(node.func)
             for arg in node.args:
                 self.visit(arg)
             for kw in node.keywords:
                 self.visit(kw.value)
         finally:
             self._covering_stack.pop()
-        # do NOT call super().generic_visit — we've handled descent above
-        return
+
+
+def _uncovered_calls(fn: ast.AST) -> list[ast.Call]:
+    v = _BodyCallVisitor()
+    for child in fn.body:  # type: ignore[attr-defined]
+        v.visit(child)
+    return v.calls
+
+
+class _Module:
+    """Same-file index of sync helpers, so a blocking call hidden behind
+    `async def inlet -> self._helper() -> requests.get` is still found.
+
+    Resolution is deliberately narrow (no cross-file analysis):
+      - `name(...)`          -> module-level `def name`
+      - `self.name(...)` / `cls.name(...)` -> `def name` in the enclosing class
+      - `Klass.name(...)`    -> `def name` in module-level `class Klass`
+    """
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.aliases = _import_aliases(tree)
+        self.functions: dict[str, ast.FunctionDef] = {}
+        self.classes: dict[str, ast.ClassDef] = {}
+        self.parent_class: dict[ast.AST, ast.ClassDef] = {}
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                self.functions[node.name] = node
+            elif isinstance(node, ast.ClassDef):
+                self.classes[node.name] = node
+        for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+            for inner in ast.walk(cls):
+                if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # innermost class wins: walk order visits outer first
+                    self.parent_class[inner] = cls
+
+    @staticmethod
+    def _method(cls: ast.ClassDef, name: str) -> ast.FunctionDef | None:
+        for node in cls.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    def resolve(self, call: ast.Call, caller: ast.AST) -> ast.FunctionDef | None:
+        fn = call.func
+        if isinstance(fn, ast.Name):
+            return self.functions.get(fn.id)
+        if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+            owner = fn.value.id
+            if owner in ("self", "cls"):
+                cls = self.parent_class.get(caller)
+                return self._method(cls, fn.attr) if cls else None
+            if owner in self.classes:
+                return self._method(self.classes[owner], fn.attr)
+        return None
+
+    def blocking_chain(
+        self, fn: ast.FunctionDef, seen: frozenset = frozenset()
+    ) -> list[tuple[str, int]] | None:
+        """If sync `fn` reaches a blocking call, return the call chain as
+        [(label, lineno), ...] ending at the blocking call; else None.
+        No memoisation: a cache filled mid-cycle can record a false None,
+        and pipeline files are small."""
+        seen = seen | {fn}
+        for call in _uncovered_calls(fn):
+            label = _blocking_label(call, self.aliases)
+            if label:
+                return [(label, call.lineno)]
+            helper = self.resolve(call, fn)
+            if helper is not None and helper not in seen:
+                rest = self.blocking_chain(helper, seen)
+                if rest:
+                    return [(_call_func_label(call) or helper.name, call.lineno)] + rest
+        return None
 
 
 def lint_file(path: Path) -> list[str]:
@@ -160,16 +245,32 @@ def lint_file(path: Path) -> list[str]:
     except SyntaxError as e:
         return [f"{path}:{e.lineno or 0}:{e.offset or 0}: SyntaxError: {e.msg}"]
 
+    mod = _Module(tree)
     findings: list[str] = []
 
     # Walk top-level + nested async defs.
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef):
-            visitor = _AsyncBodyVisitor(str(path))
-            for child in node.body:
-                visitor.visit(child)
-            for lineno, col, msg in visitor.violations:
-                findings.append(f"{path}:{lineno}:{col + 1}: {msg}")
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for call in _uncovered_calls(node):
+            label = _blocking_label(call, mod.aliases)
+            if label:
+                msg = (f"sync `{label}(...)` called inside async def — "
+                       f"wrap in `asyncio.to_thread(...)` (open-webui#67)")
+            else:
+                helper = mod.resolve(call, node)
+                chain = mod.blocking_chain(helper) if helper else None
+                if not chain:
+                    continue
+                name = _call_func_label(call) or helper.name
+                via = " -> ".join(f"{lbl}() (line {ln})" for lbl, ln in chain[:-1])
+                blocking, bline = chain[-1]
+                msg = (f"sync helper `{name}()` called inside async def reaches "
+                       f"blocking `{blocking}(...)` (line {bline})"
+                       + (f" via {via}" if via else "")
+                       + f" — call it via `asyncio.to_thread({name}, ...)` "
+                       f"(open-webui#67)")
+            findings.append(f"{path}:{call.lineno}:{call.col_offset + 1}: {msg}")
 
     return findings
 

@@ -1,16 +1,14 @@
 name: self-test
 
-# Thin on purpose. This repo has no test suite -- unlike its sibling
-# pipeline-contract-action, which has one that simply never ran -- so
-# there is nothing here to execute yet. A byte-compile plus an argparse
-# smoke is the honest ceiling until real tests exist; it catches syntax
-# errors and import-time breakage, and nothing more. Do not read a green
-# check here as "the linter works".
+# Byte-compile + action.yaml parse, plus the fixture tests in tests/
+# (stdlib unittest, no deps). The fixture tests are what say the linter
+# works; the first two steps only catch syntax/metadata breakage.
 on:
   pull_request:
     paths:
       - 'action.yaml'
       - 'lint_pipeline_async.py'
+      - 'tests/**'
       - '.github/workflows/self-test.yaml'
 
 permissions:
@@ -36,3 +34,9 @@ jobs:
           assert d.get('runs'), 'action.yaml has no runs: block'
           print('SYNTAX-CHECK-COMPLETE — action.yaml valid, script compiles')
           "
+      - name: Fixture tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v 2>&1 | tee test.log
+          grep -q '^OK' test.log
+          echo 'FIXTURE-TESTS-COMPLETE'
